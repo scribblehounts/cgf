@@ -8,6 +8,72 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      (() => {
+        if (window.storage) return;
+        const API = "/api/store";
+        const safeJson = (raw) => {
+          try { return JSON.parse(raw); }
+          catch { return null; }
+        };
+        async function srvGet(k) {
+          const r = await fetch(`${API}/${encodeURIComponent(k)}`);
+          if (!r.ok) throw new Error("store get failed");
+          return (await r.json()).value;
+        }
+        async function srvSet(k, v) {
+          const r = await fetch(`${API}/${encodeURIComponent(k)}`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ value: v }),
+          });
+          if (!r.ok) throw new Error("store set failed");
+        }
+        async function srvDel(k) {
+          await fetch(`${API}/${encodeURIComponent(k)}`, { method: "DELETE" });
+        }
+        async function srvList(prefix) {
+          const r = await fetch(`${API}?prefix=${encodeURIComponent(prefix || "")}`);
+          if (!r.ok) throw new Error("store list failed");
+          return (await r.json()).keys || [];
+        }
+        window.storage = {
+          async get(k) {
+            try {
+              const v = await srvGet(k);
+              if (v !== null && v !== undefined) {
+                localStorage.setItem(k, JSON.stringify(v));
+                return { key: k, value: v };
+              }
+              const cached = localStorage.getItem(k);
+              if (cached != null) {
+                const parsed = safeJson(cached);
+                srvSet(k, parsed).catch(() => {});
+                return { key: k, value: parsed };
+              }
+              return null;
+            } catch {
+              const cached = localStorage.getItem(k);
+              return cached == null ? null : { key: k, value: safeJson(cached) };
+            }
+          },
+          async set(k, v) {
+            localStorage.setItem(k, JSON.stringify(v));
+            try { await srvSet(k, v); } catch {}
+            return { key: k, value: v };
+          },
+          async delete(k) {
+            localStorage.removeItem(k);
+            try { await srvDel(k); } catch {}
+            return { key: k, deleted: true };
+          },
+          async list(prefix = "") {
+            try { return { keys: await srvList(prefix) }; }
+            catch { return { keys: Object.keys(localStorage).filter((x) => x.startsWith(prefix)) }; }
+          },
+        };
+      })();
+    </script>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
