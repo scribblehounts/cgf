@@ -178,9 +178,23 @@ function getFormulas(subjectKey, topicName) {
 /* ============================ storage ============================ */
 const mem = {};
 const store = {
-  ok: typeof window !== "undefined" && !!window.storage,
-  async get(k) { if (!this.ok) return mem[k] ?? null; try { const r = await window.storage.get(k); return r ? r.value : null; } catch { return null; } },
-  async set(k, v) { if (!this.ok) { mem[k] = v; return; } try { await window.storage.set(k, v); } catch (e) { console.error("save fail", e); } },
+  get ok() { return typeof window !== "undefined" && !!window.storage; },
+  async get(k) {
+    if (!this.ok) return mem[k] ?? null;
+    try {
+      const r = await window.storage.get(k);
+      return r ? r.value : null;
+    } catch (e) {
+      console.error("load fail", e);
+      return mem[k] ?? null;
+    }
+  },
+  async set(k, v) {
+    mem[k] = v;
+    if (!this.ok) return;
+    try { await window.storage.set(k, v); }
+    catch (e) { console.error("save fail", e); }
+  },
 };
 
 /* ============================ claude api ============================ */
