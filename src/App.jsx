@@ -4,7 +4,8 @@ import {
   Atom, FlaskConical, Brain, Camera, Wand2, Eye, EyeOff, Loader2,
   Plus, Minus, X, Trash2, Target, Flame, Clock, Star, CheckCircle2, Circle,
   ChevronDown, ChevronRight, BookOpen, Layers, CalendarClock, ArrowRight, Moon,
-  RotateCcw, Heart, Cat, Pencil, History as HistoryIcon, FileText, ZoomIn
+  RotateCcw, Heart, Cat, Pencil, History as HistoryIcon, FileText, ZoomIn,
+  ClipboardList, Search, Filter, Inbox, Lock
 } from "lucide-react";
 
 /* ============================ design + fonts ============================ */
@@ -244,6 +245,28 @@ Question: """${question}"""
 Respond with ONLY raw JSON (no markdown/backticks): {"steps":["step 1 ...","step 2 ..."],"answer":"final answer with units"}`;
   return JSON.parse(stripJson(await callClaude([{ role: "user", content: prompt }])));
 }
+// Tracker-only: just file a wrong question under the right subject + topic. No variants, no solution.
+async function classifyMiss({ image, desc }) {
+  const intro = image ? "An image of a question the student got WRONG is attached." : "The student described a question they got WRONG below.";
+  const prompt =
+`You are a University of Otago first-year science tutor helping a Health Sciences First Year (HSFY) student keep a tidy log of the questions they got wrong, so they can find and review them later.
+${intro}${desc ? `\nStudent's note / description: "${desc}"` : ""}
+
+File this question by classifying it:
+- "subject": exactly "PHSI191" (first-year biological physics) OR "CHEM191" (chemistry of biology & human health).
+- "topic": the single best-matching module name from the correct list.
+  PHSI191 modules: Mathematics | Mechanics | Solids & Fluids | Thermodynamics | Electricity | Optics | Radiation
+  CHEM191 modules: Aqueous Reactions | Energetics, Rates & Redox | Organic Structure & Reactions | Biological Molecules
+- "concept": a short, neat title (3-7 words) naming the specific idea being tested, e.g. "Projectile max height" or "SN1 vs SN2 mechanism".
+- "summary": ONE short sentence restating what the question asks, so the student recognises it again at a glance. No solution, no answer.
+
+Respond with ONLY raw JSON (no markdown, no backticks, no commentary), exactly:
+{"subject":"PHSI191"|"CHEM191","topic":"<module name>","concept":"short title","summary":"one sentence"}`;
+  const content = image
+    ? [{ type: "image", source: { type: "base64", media_type: image.mt, data: image.b64 } }, { type: "text", text: prompt }]
+    : prompt;
+  return JSON.parse(stripJson(await callClaude([{ role: "user", content }])));
+}
 
 /* ============================ helpers ============================ */
 const daysLeft = (iso) => Math.ceil((new Date(iso + "T09:00:00") - new Date()) / 86400000);
@@ -257,12 +280,19 @@ const fileToImg = (file) => new Promise((res, rej) => {
 });
 const SubjIcon = ({ which, ...p }) => which === "PHSI191" ? <Atom {...p} /> : <FlaskConical {...p} />;
 const subjStats = (s) => { const subs = s.modules.flatMap(m => m.subs); const strong = subs.filter(x => x.conf === "strong").length; return { strong, total: subs.length, pct: subs.length ? Math.round(strong / subs.length * 100) : 0 }; };
+// Rebuild the {b64, mt, url} image object Practice expects from a stored data-URL (for the Tracker → Variant Lab handoff).
+const imgFromUrl = (url) => { const m = /^data:([^;]+);base64,(.*)$/s.exec(url || ""); return m ? { b64: m[2], mt: m[1], url } : null; };
+// Date buckets so misses retrieve as "Today / Yesterday / Earlier this week" — e.g. "yesterday's mechanics misses".
+const DAY_MS = 86400000;
+const startOfDay = (ts) => { const d = new Date(ts); d.setHours(0, 0, 0, 0); return d.getTime(); };
+const bucketOf = (ts) => { const today = startOfDay(Date.now()), t = startOfDay(ts); return t === today ? "Today" : t === today - DAY_MS ? "Yesterday" : t > today - 7 * DAY_MS ? "Earlier this week" : "Earlier"; };
+const BUCKET_ORDER = ["Today", "Yesterday", "Earlier this week", "Earlier"];
 
 /* ============================ UI atoms ============================ */
 function Chip({ icon: Icon, tone = "blue", children }) {
   const tones = { blue: ["#eef3ff", "#2f63f6"], orange: ["#fff2e6", "#dd6a12"], green: ["#e9f9ef", "#159a4c"], amber: ["#fff6e5", "#b8860a"], indigo: ["#eef0ff", "#4150d6"], slate: ["#f1f3f7", "#5a6372"], rose: ["#ffe9f1", "#d6306f"] };
   const [bg, fg] = tones[tone] || tones.blue;
-  return <span style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 11px", borderRadius: 999, background: bg, color: fg, fontSize: 12.5, fontWeight: 600 }}>{Icon && <Icon size={13} />}{children}</span>;
+  return <span style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 11px", borderRadius: 999, background: bg, color: fg, fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap" }}>{Icon && <Icon size={13} />}{children}</span>;
 }
 function Bar({ pct, color }) { return <div className="bar"><span style={{ width: `${clamp(pct, 0, 100)}%`, background: color }} /></div>; }
 function ConfPill({ value, onCycle }) {
@@ -596,7 +626,7 @@ function Dashboard({ subjects, setSubjects, done, setDone, history, goLab }) {
 }
 
 /* ============================ variant lab ============================ */
-function Practice({ subjects, history, setHistory, bumpError }) {
+function Practice({ subjects, history, setHistory, bumpError, seed, onSeedConsumed }) {
   const [img, setImg] = useState(null);
   const [desc, setDesc] = useState("");
   const [busy, setBusy] = useState(false);
@@ -606,6 +636,16 @@ function Practice({ subjects, history, setHistory, bumpError }) {
   const fileRef = useRef(null);
 
   const takeImage = useCallback(async (file) => { if (!file) return; try { setImg(await fileToImg(file)); } catch { setErr("Couldn't read that image."); } }, []);
+
+  // Pre-fill from a tracked miss when arriving via "Make variants in the Lab".
+  useEffect(() => {
+    if (!seed) return;
+    setDesc(seed.desc || "");
+    setImg(seed.imgUrl ? imgFromUrl(seed.imgUrl) : null);
+    setErr("");
+    onSeedConsumed?.();
+  }, [seed, onSeedConsumed]);
+
   useEffect(() => {
     const onPaste = (e) => { const items = e.clipboardData?.items || []; for (const it of items) { if (it.type && it.type.startsWith("image")) { takeImage(it.getAsFile()); e.preventDefault(); break; } } };
     window.addEventListener("paste", onPaste);
@@ -785,10 +825,253 @@ function Sheets() {
   );
 }
 
+/* ============================ mistake tracker ============================ */
+function MissCard({ entry, subjects, isNew, onPatch, onDelete, onPractice, onZoom }) {
+  const unsorted = !entry.subject || !subjects[entry.subject];
+  const s = subjects[entry.subject] || subjects.PHSI191;
+  const [editing, setEditing] = useState(false);
+  const got = entry.status === "got";
+  const when = new Date(entry.ts).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
+  const accent = unsorted ? "#9ca3b0" : s.solid;
+  const ind = 31; // text indent so content lines up past the status circle
+  const selSty = { fontSize: 12, padding: "5px 9px", borderRadius: 8, border: "1px solid var(--line2)", background: "#fff" };
+  return (
+    <div className={isNew ? "rise" : ""} style={{ border: `1px solid ${isNew ? accent + "66" : "var(--line)"}`, borderLeft: `4px solid ${accent}`, borderRadius: 13, marginBottom: 10, overflow: "hidden", background: got ? "#fbfdfb" : "#fff", opacity: got ? 0.85 : 1 }}>
+      <div style={{ padding: "12px 14px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+          <button onClick={() => onPatch({ status: got ? "stuck" : "got" })} className="btn" title={got ? "Mark as still stuck" : "Mark as got it"} style={{ flexShrink: 0, width: 22, height: 22, borderRadius: 7, border: "none", background: "none", padding: 0, display: "grid", placeItems: "center", color: got ? "#22c55e" : "#cdd2dc" }}>
+            {got ? <CheckCircle2 size={20} /> : <Circle size={20} />}
+          </button>
+          <span className="ink" title={entry.concept} style={{ fontSize: 13.5, fontWeight: 700, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: got ? "line-through" : "none" }}>{entry.concept || "Untitled question"}</span>
+          <button onClick={() => onPatch({ pinned: !entry.pinned })} className="btn" title="pin" style={{ background: "none", border: "none", padding: 2, color: entry.pinned ? "#f59e0b" : "var(--faint)", flexShrink: 0 }}><Star size={14} fill={entry.pinned ? "#f59e0b" : "none"} /></button>
+          <button onClick={onDelete} className="btn" title="delete" style={{ background: "none", border: "none", color: "var(--faint)", padding: 2, flexShrink: 0 }}><Trash2 size={14} /></button>
+        </div>
+
+        {(entry.summary || entry.desc) && (
+          <p className="muted" style={{ margin: `8px 0 0 ${ind}px`, fontSize: 12.5, lineHeight: 1.5 }}>{entry.summary || entry.desc}</p>
+        )}
+
+        {entry.imgUrl && (
+          <div style={{ marginLeft: ind, marginTop: 9 }}>
+            <img src={entry.imgUrl} alt={entry.concept || "logged question"} onClick={() => onZoom(entry.imgUrl)} className="btn" style={{ maxHeight: 150, maxWidth: "100%", borderRadius: 9, border: "1px solid var(--line)", display: "block" }} />
+          </div>
+        )}
+
+        <div style={{ marginLeft: ind, marginTop: 10, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          {(unsorted || editing) ? (
+            <>
+              <span style={{ fontSize: 11.5, color: "var(--muted)" }}>{unsorted ? "Couldn't auto-sort — file it:" : "File under:"}</span>
+              <select value={entry.subject || ""} onChange={e => { const ns = e.target.value; onPatch({ subject: ns, topic: subjects[ns].modules[0].name }); setEditing(true); }} className="ink" style={selSty}>
+                {!entry.subject && <option value="" disabled>Pick subject…</option>}
+                <option value="PHSI191">PHSI191</option><option value="CHEM191">CHEM191</option>
+              </select>
+              {entry.subject && (
+                <select value={entry.topic || subjects[entry.subject].modules[0].name} onChange={e => onPatch({ topic: e.target.value })} className="ink" style={selSty}>
+                  {subjects[entry.subject].modules.map(m => <option key={m.id} value={m.name}>{m.name}</option>)}
+                </select>
+              )}
+              {!unsorted && <button onClick={() => setEditing(false)} className="btn" style={{ fontSize: 11.5, fontWeight: 600, color: s.solid, background: "none", border: "none" }}>done</button>}
+            </>
+          ) : (
+            <>
+              <Chip tone={entry.subject === "PHSI191" ? "blue" : "orange"}>{entry.subject} · {entry.topic}</Chip>
+              <button onClick={() => setEditing(true)} className="btn" title="change category" style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11.5, fontWeight: 600, color: "var(--muted)", background: "none", border: "none", padding: 0 }}><Pencil size={11} /> edit</button>
+            </>
+          )}
+          <span style={{ fontSize: 11, color: "var(--faint)", marginLeft: "auto" }}>{when}</span>
+        </div>
+
+        {!unsorted && (
+          <div style={{ marginLeft: ind, marginTop: 10 }}>
+            <button onClick={() => onPractice(entry)} className="btn" style={{ display: "inline-flex", alignItems: "center", gap: 7, fontSize: 12, fontWeight: 600, padding: "6px 12px", borderRadius: 9, color: s.solid, background: s.soft, border: `1px solid ${s.solid}33` }}>
+              <Wand2 size={13} /> Make variants in the Lab <ArrowRight size={13} />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Tracker({ subjects, misses, setMisses, goPractice }) {
+  const [img, setImg] = useState(null);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [hot, setHot] = useState(false);
+  const [newId, setNewId] = useState(null);
+  const [fSubject, setFSubject] = useState("all");
+  const [fTopic, setFTopic] = useState("all");
+  const [fStatus, setFStatus] = useState("open");
+  const [fDate, setFDate] = useState("all");
+  const [q, setQ] = useState("");
+  const [zoom, setZoom] = useState(null);
+  const fileRef = useRef(null);
+  const selStyle = { fontSize: 12, padding: "6px 10px", borderRadius: 9, border: "1px solid var(--line2)", background: "#fff" };
+
+  const takeImage = useCallback(async (file) => { if (!file) return; try { setImg(await fileToImg(file)); setErr(""); } catch { setErr("Couldn't read that image."); } }, []);
+  useEffect(() => {
+    const onPaste = (e) => { const items = e.clipboardData?.items || []; for (const it of items) { if (it.type && it.type.startsWith("image")) { takeImage(it.getAsFile()); e.preventDefault(); break; } } };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [takeImage]);
+
+  const patch = (id, p) => setMisses(ms => ms.map(m => m.id === id ? { ...m, ...p } : m));
+
+  const log = async () => {
+    if (!img && !note.trim()) { setErr("Paste a screenshot, pick a photo, or type the question first."); return; }
+    setBusy(true); setErr("");
+    const base = { id: uid(), desc: note.trim(), imgUrl: img?.url || null, ts: Date.now(), status: "stuck", pinned: false };
+    try {
+      const r = await classifyMiss({ image: img, desc: note });
+      const subject = r.subject === "CHEM191" ? "CHEM191" : "PHSI191";
+      const topic = r.topic && subjects[subject].modules.some(m => m.name === r.topic) ? r.topic : subjects[subject].modules[0].name;
+      const entry = { ...base, subject, topic, concept: r.concept || "Logged question", summary: r.summary || "" };
+      setMisses(ms => [entry, ...ms]);
+      setNewId(entry.id);
+    } catch {
+      // Never lose a miss: save it unsorted so it can be filed by hand.
+      const entry = { ...base, subject: null, topic: null, concept: note.trim().slice(0, 60) || "Untitled question", summary: "" };
+      setMisses(ms => [entry, ...ms]);
+      setNewId(entry.id);
+      setErr("Saved — but I couldn't auto-sort this one. Just pick its subject below. 💕");
+    } finally {
+      setImg(null); setNote(""); setBusy(false);
+    }
+  };
+
+  const topicsForFilter = fSubject === "all" ? [] : subjects[fSubject].modules.map(m => m.name);
+  const ql = q.trim().toLowerCase();
+  const shown = misses.filter(m => {
+    if (fSubject !== "all" && m.subject !== fSubject) return false;
+    if (fTopic !== "all" && m.topic !== fTopic) return false;
+    if (fStatus === "open" && m.status === "got") return false;
+    if (fStatus === "got" && m.status !== "got") return false;
+    if (fDate !== "all") { const b = bucketOf(m.ts); if (fDate === "today" && b !== "Today") return false; if (fDate === "yesterday" && b !== "Yesterday") return false; if (fDate === "week" && b === "Earlier") return false; }
+    if (ql) { const hay = `${m.concept || ""} ${m.summary || ""} ${m.desc || ""} ${m.topic || ""} ${m.subject || ""}`.toLowerCase(); if (!hay.includes(ql)) return false; }
+    return true;
+  });
+  const sorted = [...shown].sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.ts - a.ts);
+  const groups = BUCKET_ORDER.map(b => ({ b, items: sorted.filter(m => bucketOf(m.ts) === b) })).filter(g => g.items.length);
+  const openCount = misses.filter(m => m.status !== "got").length;
+
+  return (
+    <div className="fade">
+      <h1 className="ink" style={{ margin: "0 0 4px", fontSize: 22, fontWeight: 800 }}>Mistake Tracker</h1>
+      <p className="muted" style={{ margin: "0 0 10px", fontSize: 13.5 }}>Paste a screenshot or pick a photo of any question you got wrong — it auto-files itself under PHSI191 or CHEM191 and the right topic, so <i>yesterday's mechanics misses</i> are just a filter away. 💕</p>
+      <div style={{ marginBottom: 18 }}><Chip tone="rose" icon={Heart}>Just a tracker — make variants only when you want to</Chip></div>
+
+      {/* capture */}
+      <div className="card" style={{ padding: 20 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+          <ClipboardList size={18} color="var(--rose)" />
+          <h3 className="ink" style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>Log a question you got wrong</h3>
+        </div>
+        <div className="btn" onClick={() => fileRef.current?.click()}
+          onDragOver={e => { e.preventDefault(); setHot(true); }} onDragLeave={() => setHot(false)}
+          onDrop={e => { e.preventDefault(); setHot(false); takeImage(e.dataTransfer.files?.[0]); }}
+          style={{ borderRadius: 13, border: `1.6px dashed ${hot ? "var(--rose)" : "var(--line2)"}`, background: hot ? "#fff1f6" : "#fafbfc", padding: img ? 12 : 22, textAlign: "center" }}>
+          {img ? (
+            <div style={{ position: "relative" }}>
+              <img src={img.url} alt="question" style={{ maxHeight: 240, maxWidth: "100%", borderRadius: 10, margin: "0 auto", display: "block" }} />
+              <button onClick={(e) => { e.stopPropagation(); setImg(null); }} className="btn" style={{ position: "absolute", top: 6, right: 6, width: 28, height: 28, borderRadius: 8, border: "none", background: "rgba(0,0,0,.6)", color: "#fff", display: "grid", placeItems: "center" }}><X size={15} /></button>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 7 }}>
+              <Camera size={25} color="var(--rose)" />
+              <div className="ink" style={{ fontSize: 14, fontWeight: 600 }}>Paste a screenshot (Ctrl/Cmd+V), drop, or pick a photo</div>
+              <div className="muted" style={{ fontSize: 12 }}>Auto-sorts into PHSI191 or CHEM191 + the right topic for you</div>
+            </div>
+          )}
+          <input ref={fileRef} type="file" accept="image/*" hidden onChange={e => takeImage(e.target.files?.[0])} />
+        </div>
+        <textarea value={note} onChange={e => setNote(e.target.value)} rows={2} className="ph ink"
+          placeholder="Optional: type the question or a quick note (e.g. 'forgot to resolve weight into components')"
+          style={{ width: "100%", marginTop: 12, fontSize: 13, lineHeight: 1.5, padding: "10px 13px", borderRadius: 11, background: "#fafbfc", border: "1px solid var(--line2)", outline: "none", resize: "vertical" }} />
+        <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+          <button onClick={log} disabled={busy} className="btn" style={{ display: "inline-flex", alignItems: "center", gap: 8, fontSize: 13.5, fontWeight: 700, padding: "11px 18px", borderRadius: 12, border: "none", color: "#fff", background: "linear-gradient(135deg,#ff6b9d,#ec4899)", boxShadow: "0 6px 18px rgba(236,72,153,.28)", opacity: busy ? 0.7 : 1 }}>
+            {busy ? <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} /> : <Plus size={16} />}
+            {busy ? "Filing it…" : "Track this miss"}
+          </button>
+          {(img || note) && <button onClick={() => { setImg(null); setNote(""); setErr(""); }} className="btn" style={{ display: "inline-flex", alignItems: "center", gap: 7, fontSize: 13, fontWeight: 600, padding: "11px 16px", borderRadius: 12, background: "#fff", color: "var(--muted)", border: "1px solid var(--line2)" }}><RotateCcw size={14} /> Clear</button>}
+        </div>
+        {err && <div style={{ color: err.includes("💕") ? "var(--rose-ink)" : "#dc2626", fontSize: 13, marginTop: 10 }}>{err}</div>}
+      </div>
+
+      {/* filters */}
+      <div className="card" style={{ padding: "13px 16px", marginTop: 18, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--muted)", fontSize: 12, fontWeight: 700 }}><Filter size={14} /> Filter</div>
+        <select value={fSubject} onChange={e => { setFSubject(e.target.value); setFTopic("all"); }} className="ink" style={selStyle}>
+          <option value="all">All subjects</option><option value="PHSI191">PHSI191</option><option value="CHEM191">CHEM191</option>
+        </select>
+        <select value={fTopic} onChange={e => setFTopic(e.target.value)} disabled={fSubject === "all"} className="ink" style={{ ...selStyle, opacity: fSubject === "all" ? 0.5 : 1 }}>
+          <option value="all">All topics</option>
+          {topicsForFilter.map(t => <option key={t} value={t}>{t}</option>)}
+        </select>
+        <select value={fStatus} onChange={e => setFStatus(e.target.value)} className="ink" style={selStyle}>
+          <option value="open">Still stuck</option><option value="got">Got it</option><option value="all">All</option>
+        </select>
+        <select value={fDate} onChange={e => setFDate(e.target.value)} className="ink" style={selStyle}>
+          <option value="all">Any time</option><option value="today">Today</option><option value="yesterday">Yesterday</option><option value="week">This week</option>
+        </select>
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1, minWidth: 160, background: "#fafbfc", border: "1px solid var(--line2)", borderRadius: 9, padding: "6px 10px" }}>
+          <Search size={14} color="var(--faint)" />
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search misses…" className="ph ink" style={{ flex: 1, minWidth: 0, border: "none", outline: "none", background: "transparent", fontSize: 12.5 }} />
+          {q && <button onClick={() => setQ("")} className="btn" style={{ background: "none", border: "none", color: "var(--faint)", padding: 0, display: "grid", placeItems: "center" }}><X size={13} /></button>}
+        </div>
+      </div>
+
+      {/* list */}
+      <div style={{ marginTop: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Inbox size={16} color="var(--muted)" />
+          <h3 className="ink" style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>Your misses</h3>
+          <span style={{ fontSize: 12, color: "var(--faint)", fontWeight: 600 }}>{shown.length} shown · {openCount} still stuck</span>
+        </div>
+        {misses.length === 0 ? (
+          <div className="card" style={{ padding: 30, textAlign: "center" }}>
+            <Heart size={22} color="#ffb3cd" fill="#ffb3cd" style={{ marginBottom: 8 }} />
+            <p className="muted" style={{ margin: 0, fontSize: 13 }}>No misses tracked yet. Every question you log above gets auto-sorted and saved here so nothing slips through. You've got this 💖</p>
+          </div>
+        ) : groups.length === 0 ? (
+          <div className="card" style={{ padding: 26, textAlign: "center" }}>
+            <p className="muted" style={{ margin: 0, fontSize: 13 }}>Nothing matches these filters. <button onClick={() => { setFSubject("all"); setFTopic("all"); setFStatus("all"); setFDate("all"); setQ(""); }} className="btn" style={{ background: "none", border: "none", color: "var(--blue)", fontWeight: 600, fontSize: 13, padding: 0 }}>Clear filters</button></p>
+          </div>
+        ) : groups.map(g => (
+          <div key={g.b} style={{ marginBottom: 18 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 2px 8px" }}>
+              <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: ".08em", color: "var(--faint)" }}>{g.b.toUpperCase()}</span>
+              <span style={{ flex: 1, height: 1, background: "var(--line)" }} />
+              <span style={{ fontSize: 11, color: "var(--faint)", fontWeight: 600 }}>{g.items.length}</span>
+            </div>
+            {g.items.map(m => (
+              <MissCard key={m.id} entry={m} subjects={subjects} isNew={m.id === newId}
+                onPatch={p => patch(m.id, p)} onDelete={() => setMisses(ms => ms.filter(x => x.id !== m.id))}
+                onPractice={goPractice} onZoom={setZoom} />
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {zoom && (
+        <div onClick={() => setZoom(null)} style={{ position: "fixed", inset: 0, background: "rgba(10,14,25,.85)", zIndex: 60, display: "flex", flexDirection: "column", padding: 20 }}>
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+            <button onClick={() => setZoom(null)} className="btn" style={{ width: 34, height: 34, display: "grid", placeItems: "center", color: "#fff", background: "rgba(255,255,255,.14)", border: "none", borderRadius: 9 }}><X size={17} /></button>
+          </div>
+          <div onClick={e => e.stopPropagation()} style={{ flex: 1, overflow: "auto", borderRadius: 12, background: "#fff" }}>
+            <img src={zoom} alt="question" style={{ width: "100%", display: "block" }} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ============================ sidebar ============================ */
-function Sidebar({ active, setActive, histCount }) {
+function Sidebar({ active, setActive, histCount, missCount }) {
   const nav = [
     { k: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+    { k: "tracker", label: "Mistake Tracker", icon: ClipboardList, badge: missCount },
     { k: "lab", label: "Variant Lab", icon: Sparkles, badge: histCount },
     { k: "sheets", label: "Cheat Sheets", icon: FileText },
     { k: "schedule", label: "Schedule", icon: CalendarDays },
@@ -827,28 +1110,74 @@ function Sidebar({ active, setActive, histCount }) {
   );
 }
 
+/* ============================ lock screen ============================ */
+const UNLOCK_KEY = "cockpit:unlocked:v1";
+const PASSPHRASE = "rosashin";
+const isUnlocked = () => { try { return localStorage.getItem(UNLOCK_KEY) === "yes"; } catch { return false; } };
+
+function Gate({ onUnlock }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => { ref.current?.focus(); }, []);
+  const submit = (e) => {
+    e.preventDefault();
+    if (pw.trim().toLowerCase() === PASSPHRASE) {
+      try { localStorage.setItem(UNLOCK_KEY, "yes"); } catch {}
+      onUnlock();
+    } else { setErr(true); setPw(""); ref.current?.focus(); }
+  };
+  const hearts = [{ s: 20, t: 18, l: "12%", d: "0s" }, { s: 13, t: 64, l: "8%", d: "1.3s" }, { s: 17, t: 28, l: "88%", d: ".6s" }, { s: 11, t: 72, l: "92%", d: "2s" }];
+  return (
+    <div className="app" style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 20, background: "linear-gradient(135deg,#fff1f6 0%,#ffe6ef 55%,#ffdcea 100%)" }}>
+      <Style />
+      {hearts.map((h, i) => <Heart key={i} className="heartf" size={h.s} fill="#ffb3cd" style={{ top: h.t, left: h.l, animationDelay: h.d, opacity: 0.5 }} />)}
+      <form onSubmit={submit} className="card rise" style={{ width: "100%", maxWidth: 380, padding: 30, textAlign: "center", border: "1px solid #ffd0e0", position: "relative", zIndex: 1 }}>
+        <div className="beat" style={{ width: 60, height: 60, borderRadius: 18, margin: "0 auto 16px", background: "linear-gradient(135deg,#ff6b9d,#ff8fb3)", display: "grid", placeItems: "center", boxShadow: "0 6px 18px rgba(236,72,153,.35)" }}>
+          <Lock size={28} color="#fff" />
+        </div>
+        <h1 className="ink" style={{ margin: "0 0 4px", fontSize: 21, fontWeight: 800 }}>Hi my love 💕</h1>
+        <p style={{ margin: "0 0 20px", fontSize: 13.5, lineHeight: 1.5, color: "var(--rose-ink)", fontWeight: 500 }}>Type our little password to come in. You'll only have to do this once on this device. 🥰</p>
+        <input ref={ref} type="password" value={pw} onChange={e => { setPw(e.target.value); setErr(false); }} placeholder="password"
+          className="ph ink" autoComplete="off"
+          style={{ width: "100%", textAlign: "center", fontSize: 15, letterSpacing: ".06em", padding: "12px 14px", borderRadius: 12, background: "#fff", border: `1.6px solid ${err ? "#f43f6e" : "var(--line2)"}`, outline: "none" }} />
+        {err && <div style={{ color: "#e11d63", fontSize: 12.5, marginTop: 9, fontWeight: 600 }}>Hmm, that's not it 💔 try again</div>}
+        <button type="submit" className="btn" style={{ width: "100%", marginTop: 16, display: "inline-flex", justifyContent: "center", alignItems: "center", gap: 8, fontSize: 14, fontWeight: 700, padding: "12px", borderRadius: 12, border: "none", color: "#fff", background: "linear-gradient(135deg,#ff6b9d,#ec4899)", boxShadow: "0 6px 18px rgba(236,72,153,.32)" }}>
+          Let me in <Heart size={15} fill="#fff" />
+        </button>
+      </form>
+    </div>
+  );
+}
+
 /* ============================ root ============================ */
 export default function App() {
+  const [authed, setAuthed] = useState(isUnlocked);
   const [active, setActive] = useState("dashboard");
   const [subjects, setSubjects] = useState(DEFAULTS);
   const [history, setHistory] = useState([]);
+  const [misses, setMisses] = useState([]);
   const [done, setDone] = useState({});
   const [loaded, setLoaded] = useState(false);
+  const [labSeed, setLabSeed] = useState(null);
 
   useEffect(() => {
     (async () => {
       const s = await store.get("cockpit:subjects:v2");
       const h = await store.get("cockpit:history:v1");
+      const ms = await store.get("cockpit:misses:v1");
       const sch = await store.get("cockpit:schedule:v1");
       if (s) setSubjects(s);
       if (h) setHistory(h);
       else { const old = await store.get("cockpit:deck:v1"); if (Array.isArray(old)) setHistory(old.map(e => ({ ...e, subject: e.subj || "PHSI191", pinned: false }))); }
+      if (Array.isArray(ms)) setMisses(ms);
       if (sch) setDone(sch);
       setLoaded(true);
     })();
   }, []);
   useEffect(() => { if (loaded) store.set("cockpit:subjects:v2", subjects); }, [subjects, loaded]);
   useEffect(() => { if (loaded) store.set("cockpit:history:v1", history); }, [history, loaded]);
+  useEffect(() => { if (loaded) store.set("cockpit:misses:v1", misses); }, [misses, loaded]);
   useEffect(() => { if (loaded) store.set("cockpit:schedule:v1", done); }, [done, loaded]);
 
   const bumpError = (sk, topicName) => setSubjects(p => {
@@ -858,13 +1187,22 @@ export default function App() {
     return n;
   });
 
+  // Tracker → Variant Lab: seed the Lab with a logged miss, then switch tabs.
+  const practiceFromMiss = (entry) => {
+    setLabSeed({ desc: entry.desc || entry.summary || "", imgUrl: entry.imgUrl || null });
+    setActive("lab");
+  };
+
+  if (!authed) return <Gate onUnlock={() => setAuthed(true)} />;
+
   return (
     <div className="app layout">
       <Style />
-      <Sidebar active={active} setActive={setActive} histCount={history.length} />
+      <Sidebar active={active} setActive={setActive} histCount={history.length} missCount={misses.filter(m => m.status !== "got").length} />
       <main className="main">
         {active === "dashboard" && <Dashboard subjects={subjects} setSubjects={setSubjects} done={done} setDone={setDone} history={history} goLab={() => setActive("lab")} />}
-        {active === "lab" && <Practice subjects={subjects} history={history} setHistory={setHistory} bumpError={bumpError} />}
+        {active === "tracker" && <Tracker subjects={subjects} misses={misses} setMisses={setMisses} goPractice={practiceFromMiss} />}
+        {active === "lab" && <Practice subjects={subjects} history={history} setHistory={setHistory} bumpError={bumpError} seed={labSeed} onSeedConsumed={() => setLabSeed(null)} />}
         {active === "sheets" && <Sheets />}
         {active === "schedule" && <Schedule done={done} setDone={setDone} />}
         <div className="muted" style={{ textAlign: "center", marginTop: 34, fontSize: 11 }}>
